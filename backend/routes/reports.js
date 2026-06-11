@@ -1,195 +1,166 @@
 /**
  * Reports API Routes
- * Endpoints for generating various reports
+ * Generate various reports (Expired, Low Stock, Monthly Dispensing)
  */
 
 const express = require('express');
 const router = express.Router();
-const db = require('../utils/database');
+const { dbGet, dbAll } = require('../database/db');
+const PDFDocument = require('pdfkit');
+const fs = require('fs');
+const path = require('path');
 
 /**
- * GET /api/reports/expiry
- * Generate expiry report
+ * GET /api/reports/expired - Get expired medicines report
  */
-router.get('/expiry', async (req, res) => {
+router.get('/expired', async (req, res) => {
   try {
-    const report = await db.all(`
-      SELECT 
-        m.name,
-        m.manufacturer,
-        b.batch_number,
-        b.expiry_date,
-        i.current_stock,
-        CASE 
-          WHEN b.expiry_date < date('now') THEN 'EXPIRED'
-          WHEN b.expiry_date < date('now', '+7 days') THEN 'EXPIRING (0-7 days)'
-          WHEN b.expiry_date < date('now', '+30 days') THEN 'EXPIRING (7-30 days)'
-          ELSE 'VALID'
-        END as status,
-        CAST((julianday(b.expiry_date) - julianday('now')) AS INTEGER) as days_remaining
-      FROM inventory i
-      JOIN medicines m ON i.medicine_id = m.id
-      JOIN batches b ON i.batch_id = b.id
-      WHERE b.expiry_date <= date('now', '+30 days')
-      ORDER BY b.expiry_date ASC
-    `);
-
-    const summary = {
-      total_items: report.length,
-      expired: report.filter(r => r.status === 'EXPIRED').length,
-      expiring_7_days: report.filter(r => r.status === 'EXPIRING (0-7 days)').length,
-      expiring_30_days: report.filter(r => r.status === 'EXPIRING (7-30 days)').length,
-      generated_at: new Date().toISOString()
-    };
+    const today = new Date().toISOString().split('T')[0];
+    const expiredMedicines = await dbAll(`
+      SELECT * FROM medicines WHERE is_active = 1 AND expiry_date < ?
+      ORDER BY expiry_date ASC
+    `, [today]);
 
     res.json({
-      success: true,
-      report_type: 'Expiry Report',
-      summary,
-      data: report
+      total_expired: expiredMedicines.length,
+      medicines: expiredMedicines,
+      generated_at: new Date().toISOString()
     });
-  } catch (error) {
-    console.error('Error generating expiry report:', error);
-    res.status(500).json({ error: 'Failed to generate report', details: error.message });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
 /**
- * GET /api/reports/lowstock
- * Generate low stock report
+ * GET /api/reports/low-stock - Get low stock medicines report
  */
-router.get('/lowstock', async (req, res) => {
+router.get('/low-stock', async (req, res) => {
   try {
-    const report = await db.all(`
-      SELECT 
-        m.name,
-        m.manufacturer,
-        b.batch_number,
-        i.current_stock,
-        i.minimum_threshold,
-        i.maximum_stock,
-        (i.minimum_threshold - i.current_stock) as shortage,
-        CASE 
-          WHEN i.current_stock = 0 THEN 'OUT OF STOCK'
-          WHEN i.current_stock <= i.minimum_threshold THEN 'LOW STOCK'
-          ELSE 'NORMAL'
-        END as status
-      FROM inventory i
-      JOIN medicines m ON i.medicine_id = m.id
-      JOIN batches b ON i.batch_id = b.id
-      WHERE i.current_stock <= i.minimum_threshold
-      ORDER BY i.current_stock ASC
+    const lowStockMedicines = await dbAll(`
+      SELECT * FROM medicines WHERE is_active = 1 AND quantity < 10
+      ORDER BY quantity ASC
     `);
 
-    const summary = {
-      total_low_stock: report.length,
-      out_of_stock: report.filter(r => r.status === 'OUT OF STOCK').length,
-      low_stock: report.filter(r => r.status === 'LOW STOCK').length,
-      total_shortage: report.reduce((sum, r) => sum + (r.shortage || 0), 0),
-      generated_at: new Date().toISOString()
-    };
-
     res.json({
-      success: true,
-      report_type: 'Low Stock Report',
-      summary,
-      data: report
+      total_low_stock: lowStockMedicines.length,
+      medicines: lowStockMedicines,
+      generated_at: new Date().toISOString()
     });
-  } catch (error) {
-    console.error('Error generating low stock report:', error);
-    res.status(500).json({ error: 'Failed to generate report', details: error.message });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
 /**
- * GET /api/reports/forecast
- * Generate stock forecast report
+ * GET /api/reports/monthly-dispensing - Get monthly dispensing report
  */
-router.get('/forecast', async (req, res) => {
+router.get('/monthly-dispensing', async (req, res) => {
   try {
-    const report = await db.all(`
+    const monthlyData = await dbAll(`
       SELECT 
-        m.id,
-        m.name,
-        m.manufacturer,
-        (SELECT SUM(quantity_dispensed) FROM dispensing_logs WHERE medicine_id = m.id AND dispensed_at > datetime('now', '-30 days')) as dispensed_30days,
-        ROUND((SELECT SUM(quantity_dispensed) FROM dispensing_logs WHERE medicine_id = m.id AND dispensed_at > datetime('now', '-30 days')) / 30.0, 2) as avg_daily,
-        (SELECT SUM(current_stock) FROM inventory WHERE medicine_id = m.id) as current_stock,
-        CASE 
-          WHEN (SELECT SUM(quantity_dispensed) FROM dispensing_logs WHERE medicine_id = m.id AND dispensed_at > datetime('now', '-30 days')) > 0 
-          THEN ROUND((SELECT SUM(current_stock) FROM inventory WHERE medicine_id = m.id) / 
-               ((SELECT SUM(quantity_dispensed) FROM dispensing_logs WHERE medicine_id = m.id AND dispensed_at > datetime('now', '-30 days')) / 30.0), 0)
-          ELSE 999
-        END as days_of_supply
-      FROM medicines m
-      WHERE m.is_active = 1
-      ORDER BY days_of_supply ASC
+        strftime('%Y-%m', created_at) as month,
+        m.medicine_name,
+        SUM(quantity_dispensed) as total_dispensed,
+        COUNT(*) as transaction_count,
+        AVG(dl.quantity_dispensed) as avg_dispensed
+      FROM dispensing_logs dl
+      LEFT JOIN medicines m ON dl.medicine_id = m.id
+      GROUP BY month, medicine_id
+      ORDER BY month DESC
     `);
 
-    const summary = {
-      total_medicines: report.length,
-      critical_supply: report.filter(r => r.days_of_supply < 7).length,
-      low_supply: report.filter(r => r.days_of_supply >= 7 && r.days_of_supply < 30).length,
-      adequate_supply: report.filter(r => r.days_of_supply >= 30).length,
-      generated_at: new Date().toISOString()
-    };
-
     res.json({
-      success: true,
-      report_type: 'Stock Forecast Report',
-      summary,
-      data: report
+      monthly_data: monthlyData,
+      generated_at: new Date().toISOString()
     });
-  } catch (error) {
-    console.error('Error generating forecast report:', error);
-    res.status(500).json({ error: 'Failed to generate report', details: error.message });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
 /**
- * GET /api/reports/dispensing
- * Generate dispensing report for date range
+ * GET /api/reports/pdf/expired - Download expired medicines as PDF
  */
-router.get('/dispensing', async (req, res) => {
+router.get('/pdf/expired', async (req, res) => {
   try {
-    const startDate = req.query.start_date || new Date(Date.now() - 30*24*60*60*1000).toISOString().split('T')[0];
-    const endDate = req.query.end_date || new Date().toISOString().split('T')[0];
+    const today = new Date().toISOString().split('T')[0];
+    const expiredMedicines = await dbAll(`
+      SELECT * FROM medicines WHERE is_active = 1 AND expiry_date < ?
+    `, [today]);
 
-    const report = await db.all(`
+    const doc = new PDFDocument();
+    const filename = `expired-medicines-${new Date().toISOString().split('T')[0]}.pdf`;
+    
+    res.setHeader('Content-disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-type', 'application/pdf');
+
+    doc.pipe(res);
+    doc.fontSize(20).text('Expired Medicines Report', 100, 100);
+    doc.fontSize(12).text(`Generated: ${new Date().toLocaleString()}`, 100, 130);
+    
+    let yPosition = 170;
+    expiredMedicines.forEach((medicine, index) => {
+      doc.fontSize(11).
+        text(`${index + 1}. ${medicine.medicine_name}`, 100, yPosition).
+        text(`   Batch: ${medicine.batch_number} | Expired: ${medicine.expiry_date}`, 120, yPosition + 15).
+        text(`   Manufacturer: ${medicine.manufacturer}`, 120, yPosition + 30);
+      yPosition += 60;
+    });
+
+    doc.end();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/reports/dashboard - Get comprehensive dashboard report
+ */
+router.get('/dashboard', async (req, res) => {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const thirtyDaysLater = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+    const overview = await dbGet(`
       SELECT 
-        d.patient_name,
-        d.patient_age,
-        d.patient_gender,
-        d.diagnosis,
-        m.name as medicine_name,
-        b.batch_number,
-        d.quantity_dispensed,
-        d.dispensed_at,
-        u.name as healthcare_worker
-      FROM dispensing_logs d
-      JOIN medicines m ON d.medicine_id = m.id
-      JOIN batches b ON d.batch_id = b.id
-      JOIN users u ON d.user_id = u.id
-      WHERE DATE(d.dispensed_at) BETWEEN ? AND ?
-      ORDER BY d.dispensed_at DESC
-    `, [startDate, endDate]);
+        COUNT(*) as total_medicines,
+        SUM(quantity) as total_quantity
+      FROM medicines WHERE is_active = 1
+    `);
 
-    const summary = {
-      total_dispensings: report.length,
-      date_range: `${startDate} to ${endDate}`,
-      total_patients: new Set(report.map(r => r.patient_name)).size,
-      generated_at: new Date().toISOString()
-    };
+    const expiredCount = await dbGet(`
+      SELECT COUNT(*) as count FROM medicines WHERE is_active = 1 AND expiry_date < ?
+    `, [today]);
+
+    const expiringCount = await dbGet(`
+      SELECT COUNT(*) as count FROM medicines WHERE is_active = 1 AND expiry_date BETWEEN ? AND ?
+    `, [today, thirtyDaysLater]);
+
+    const lowStockCount = await dbGet(`
+      SELECT COUNT(*) as count FROM medicines WHERE is_active = 1 AND quantity < 10
+    `);
+
+    const totalDispensed = await dbGet(`
+      SELECT SUM(quantity_dispensed) as total FROM dispensing_logs WHERE created_at >= date('now', '-30 days')
+    `);
 
     res.json({
-      success: true,
-      report_type: 'Dispensing Report',
-      summary,
-      data: report
+      overview: {
+        total_medicines: overview?.total_medicines || 0,
+        total_quantity: overview?.total_quantity || 0
+      },
+      alerts: {
+        expired_medicines: expiredCount?.count || 0,
+        expiring_soon: expiringCount?.count || 0,
+        low_stock: lowStockCount?.count || 0
+      },
+      dispensing: {
+        last_30_days: totalDispensed?.total || 0
+      },
+      generated_at: new Date().toISOString()
     });
-  } catch (error) {
-    console.error('Error generating dispensing report:', error);
-    res.status(500).json({ error: 'Failed to generate report', details: error.message });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
